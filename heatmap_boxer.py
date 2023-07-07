@@ -7,7 +7,7 @@
 # 
 # This is required to import the required packages!
 
-# In[2]:
+# In[ ]:
 
 
 import numpy as np
@@ -19,12 +19,17 @@ import cv2
 import pickle
 import json
 from PIL import Image
+import torch.nn.functional as F
 import clip
 from clip.model import AttentionPool2d
 from clip.model import ModifiedResNet
+from tqdm.auto import tqdm
 from typing import Tuple, Union
 from clip.model import CLIP
 from clip.model import convert_weights
+from torchvision.ops import generalized_box_iou_loss
+from torchvision.ops.boxes import box_convert
+
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -45,23 +50,23 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # **The path of the dataset must be adjusted based on the location of the dataset folder!**
 
-# In[3]:
+# In[ ]:
 
 
 # adjust based on the location of the dataset folder!
-refcocog_path =  "refcocog"
+refcocog_path =  "E:/DL_Datasets/refcocog"
 
 
 # Load the pickle file and the instances json file
 
-# In[4]:
+# In[ ]:
 
 
 pick = pickle.load(open(refcocog_path+"/annotations/refs(umd).p", "rb"))
 jsn = json.load(open(refcocog_path+"/annotations/instances.json", "rb"))
 
 
-# In[5]:
+# In[ ]:
 
 
 # set of all images
@@ -85,7 +90,7 @@ for a in jsn['annotations']:
 
 # **Build dataset splits**
 
-# In[6]:
+# In[ ]:
 
 
 train_data, train_label       = [], []
@@ -113,10 +118,13 @@ for p in pick:
 print(f"train {len(train_data)}, validation {len(validate_data)}, test {len(test_data)}")
 
 
-# **Display an image with a bounding box**
+# ### Dataset utils methods
 
-# In[7]:
+# In[ ]:
 
+
+import random
+import torchvision.transforms as transforms
 
 def draw_box_on_image(image,size, bbox, color):
     w, h = size
@@ -124,11 +132,17 @@ def draw_box_on_image(image,size, bbox, color):
     p2 = (int((bbox[0]+bbox[2])*w), int((bbox[1] + bbox[3])*h))
     cv2.rectangle(image, p1, p2, color, 3)
 
-def get_batch_data(batch):
+def get_batch_data(batch, image_augment=False, augment_p=0.25):
     images, target_boxes, prompts = [], [], []
     for image_path, prompt, box in batch:
         image = Image.open(image_path).convert("RGB")
         w, h = image.size
+        if image_augment and random.random()<augment_p:
+            augment_transform = transforms.Compose([
+                transforms.ColorJitter(brightness=(0.1,0.6), contrast=(0.4, 1),saturation=(0, 0.4), hue=(-0.5, 0.5))
+            ])
+            image = augment_transform(image)
+            
         correct_box = [box[0] / w, box[1] / h, box[2] / w, box[3] / h]
         target_boxes.append(correct_box)
         images.append(image)            
@@ -151,6 +165,102 @@ def view_image_with_bbox(image_path, prompt, bbox):
     plt.imshow(image)
     plt.title(prompt)
     plt.show()
+
+
+# # Baseline
+# 
+# In the following section there is the implementation of the baseline method suggested, using YOLO as bounding box extractor.
+# 
+# The pipeline is to feed the image to YOLO that returns a set of bounding boxes.
+# 
+# Each subimage corresponding to each bounding box is extracted and then the similarity between the CLIP's encoding of the subimage and the prompt is computed.
+# The bounding box with the highest similarity is returned as output.
+# 
+# - **GIoU**: `0.574`
+# 
+
+# ### Code
+
+# In[ ]:
+
+
+execute_baseline = False
+
+
+# In[ ]:
+
+
+if execute_baseline:
+    yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+    base_clip, base_clip_preprocess = clip.load("RN50")
+    losses = []
+
+    for idx, data in enumerate(tqdm(test_data)):
+        image_path, prompt, target_box = data
+        image =  Image.open(image_path).convert("RGB")
+
+        image_copy = np.asarray(image)
+        cropped_images = []
+
+        yolo_boxes = yolo_model(image_path).xyxy[0]
+
+        # when yolo returns no prediction, just use the whole thing as bbox
+        if len(yolo_boxes) == 0:
+            target_tensor = torch.tensor(target_box).cuda()
+            target_tensor = box_convert(target_tensor, in_fmt="xywh", out_fmt="xyxy")
+
+            h, w = image.size
+            ans = torch.tensor([0, 0, h, w])
+
+            loss = generalized_box_iou_loss(ans, target_tensor)
+            losses.append(loss.item())
+
+            continue
+
+        for yolo_box in yolo_boxes:
+            x1, y1, x2, y2 = yolo_box[:4]
+            x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
+
+            cropped_image = image_copy[y1:y2, x1:x2]
+            cropped_images.append(cropped_image)
+
+            # plt.imshow(np.asarray(cropped_image))
+            # plt.show()
+
+        preprocessed_images = []
+        for img_np in cropped_images:
+            img = Image.fromarray(img_np)
+            preprocessed_image = base_clip_preprocess(img)
+            preprocessed_images.append(preprocessed_image)
+
+        cropped_image_tensors = torch.stack(preprocessed_images).cuda()
+
+        text_tokens = clip.tokenize(prompt).cuda()
+        text_tokens.shape
+
+        with torch.no_grad():
+            image_features = base_clip.encode_image(cropped_image_tensors).float()
+            text_features = base_clip.encode_text(text_tokens).float()
+
+        # divide by norm
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+
+        similarity = torch.matmul(image_features, text_features.T)
+        similarity
+
+        ans = similarity.argmax()
+        ans = yolo_boxes[ans][:4]
+
+        target_tensor = torch.tensor(target_box).cuda()
+        target_tensor = box_convert(target_tensor, in_fmt="xywh", out_fmt="xyxy")
+
+        loss = generalized_box_iou_loss(ans, target_tensor)
+        losses.append(loss.item())
+
+    # print(losses)
+
+    print(f"GIoU: {sum(losses) / len(losses)}")
 
 
 # # Model
@@ -197,7 +307,7 @@ def view_image_with_bbox(image_path, prompt, bbox):
 # 
 # The final method `build_feature_extractor_model` has the job of creating this customized CLIP and to enable **transfer learning** from CLIP by copying the relative weights into the custom model.
 
-# In[8]:
+# In[ ]:
 
 
 # load the CLIP model
@@ -346,7 +456,7 @@ def build_feature_extractor_model(clip_model):
 # 
 # ![1.png](attachment:1.png) ![h_1.png](attachment:h_1.png)
 
-# In[9]:
+# In[ ]:
 
 
 class ResNetHighResV2(nn.Module):
@@ -407,7 +517,7 @@ class ResNetHighResV2(nn.Module):
 # 
 # The second sequential layer is composed of an `AvgPool1d` that has the job to smooth the heatmap, followed by a **FFNN** that effectively regresses the four points.
 
-# In[17]:
+# In[ ]:
 
 
 class ScaledSigmoid(nn.Module):
@@ -431,17 +541,26 @@ class HeatmapToBox(nn.Module):
             nn.AvgPool1d(4),
 
             nn.Linear(676, 256),
-            #nn.Dropout(p=0.05),            
-            ScaledSigmoid(factor=4),
+            nn.BatchNorm1d(256),
+            nn.Dropout(p=0.5),             
+            nn.Sigmoid(), 
 
             nn.Linear(256, 128),  
-            #nn.Dropout(p=0.05),          
-            ScaledSigmoid(factor=2),
+            nn.BatchNorm1d(128),
+            nn.Dropout(p=0.5),          
+            nn.Sigmoid(), 
 
             nn.Linear(128, 4),
-            ScaledSigmoid(factor=1),       
+            nn.Sigmoid(),       
         ) 
+        print(f"bboxer parameters: {self.params_count()}")
          
+    def params_count(self):
+        c = 0
+        for p in self.parameters():
+            c += p.numel()
+        return c
+
     def forward(self, x):   
         return self.seq(self.conv(x.unsqueeze(dim=1)))
 
@@ -457,6 +576,7 @@ class HeatmapToBox(nn.Module):
 # This of course, comes with some drawbacks. First of all, all the burden of training weights uniquely on the head. Since, due to computational power and time limits, the model cannot be extremely large and complicated, this can results in generally worst overall performance, adaptation and generalization capabilities.
 # 
 # Moreover, as anticipated, the training process has not been carried out on all the more than **80000** instances of the training data for obvious reasons regarding training time and computational complexity.
+# 
 
 # **Intersection Over Union**
 # 
@@ -464,33 +584,44 @@ class HeatmapToBox(nn.Module):
 # 
 # Boxes are converted from the **RefCOCOg** format to the format required by `torchvision`.
 
-# In[11]:
+# In[ ]:
 
-
-from torchvision.ops import generalized_box_iou_loss
-from torchvision.ops.boxes import box_convert
 
 def iou(boxes1, boxes2) -> torch.Tensor:
     return generalized_box_iou_loss(box_convert(boxes1,in_fmt="xywh",out_fmt="xyxy"),box_convert(boxes2,in_fmt="xywh",out_fmt="xyxy"),reduction="mean")
 
 
+# **Training results**
+# 
+# > The presented results have been achieved on the training set
+# 
+# - MSELoss: `5.7E-3`
+# - GIoU : `0.51`
+# 
+# -----
+# 
+# ![14.png](attachment:14.png)
+# ![12.png](attachment:12.png)
+# ![8.png](attachment:8.png)
+# ![15.png](attachment:15.png)
+
 # **Training parameters**
 
-# In[21]:
+# In[ ]:
 
 
-train_size = 8192
-train_batch_size = 64
-epochs = 1024
+train_size = 512
+train_batch_size = 16
+epochs = 256
 mini_train_data = train_data[:train_size]
 
-validation_size = 1024
-validation_batch_size = 64
-validation_module = 1E5
+validation_size = 256
+validation_batch_size = 16
+validation_module = 16
 mini_val_data = validate_data[:validation_size]
 
-test_size = 1024
-test_batch_size = 64
+test_size = 256
+test_batch_size = 16
 mini_test_data = test_data[:test_size]
 
 
@@ -499,16 +630,24 @@ mini_test_data = test_data[:test_size]
 # - Validation
 # - Test
 
-# In[12]:
+# In[ ]:
 
 
-def evaluate_batch_routine(model, loss_fn, feature_extractor, data_batch, graphical=False):
+import os
+
+def evaluate_batch_routine(model, loss_fn, feature_extractor, data_batch, graphical=False, save=False):
+    if save:
+        try: 
+            os.mkdir("imgs") 
+        except OSError as error: 
+            pass 
     model.eval()
     images, prompts, target_boxes = get_batch_data(data_batch)    
     with torch.no_grad():
         heatmaps = feature_extractor(images, prompts)
         heatmaps_tensor = torch.tensor(np.array(heatmaps))
         prediction_boxes = model(heatmaps_tensor)
+    c =0
     if graphical:
         for img, p, heatmap, correct, predicted in zip(images, prompts, heatmaps, target_boxes, prediction_boxes):
             size = img.size
@@ -525,9 +664,12 @@ def evaluate_batch_routine(model, loss_fn, feature_extractor, data_batch, graphi
             ax2=f.add_subplot(1,2, 2)
             ax2.imshow(heatmap)
             ax2.axis("off")
+            if save:
+                plt.savefig(f"imgs/{c}.png")
             plt.show()
+            c +=1 
             
-    print(f"correct {correct}, predict: {predicted}")
+        print(f"correct {correct}, predict: {predicted}")
 
     loss = loss_fn(prediction_boxes, target_boxes)
     return loss.item(), iou(prediction_boxes, target_boxes)
@@ -540,7 +682,7 @@ def training_routine(model, loss_fn, feature_extractor, optimizer):
         images, prompts, target_boxes = get_batch_data(batch_data)  
         with torch.no_grad():
             heatmaps = feature_extractor(images, prompts)            
-        heatmaps_tensor = torch.tensor(np.array(heatmaps))
+            heatmaps_tensor = torch.tensor(np.array(heatmaps))
 
         optimizer.zero_grad()
         prediction_boxes = model(heatmaps_tensor)
@@ -564,10 +706,9 @@ def validation_routine(model, loss_fn, feature_extractor):
             heatmaps = feature_extractor(images, prompts)
             heatmaps_tensor = torch.tensor(np.array(heatmaps))
             prediction_boxes = model(heatmaps_tensor)
-
-        loss = loss_fn(prediction_boxes, target_boxes)
-        epoch_loss.append(loss.item())
-        giou.append(iou(prediction_boxes, target_boxes))
+            loss = loss_fn(prediction_boxes, target_boxes)
+            epoch_loss.append(loss.item())
+            giou.append(iou(prediction_boxes, target_boxes))
 
     return sum(epoch_loss) / len(epoch_loss), sum(giou) / len(giou)
 
@@ -584,17 +725,16 @@ def test_routine(model, loss_fn, feature_extractor):
             heatmaps = feature_extractor(images, prompts)
             heatmaps_tensor = torch.tensor(np.array(heatmaps))
             prediction_boxes = model(heatmaps_tensor)
-            
-        loss = loss_fn(prediction_boxes, target_boxes)
-        epoch_loss.append(loss.item())
-        giou.append(iou(prediction_boxes, target_boxes))
+            loss = loss_fn(prediction_boxes, target_boxes)
+            epoch_loss.append(loss.item())
+            giou.append(iou(prediction_boxes, target_boxes))
         
     return sum(epoch_loss) / len(epoch_loss), sum(giou) / len(giou)
 
 
 # ### Training Cycle
 
-# In[22]:
+# In[ ]:
 
 
 feature_extractor = ResNetHighResV2(clip_preprocess, clip_model, clip.tokenize, remap_heatmaps=True, temperature=0.3)
@@ -614,24 +754,71 @@ for epoch in range(epochs):
     if epoch != 0 and epoch % validation_module == 0:        
         val_loss, giou = validation_routine(bboxer, loss_fn, feature_extractor)
         if val_loss+giou < best:
-            torch.save(bboxer.state_dict(), "checkpoint")
+            torch.save(bboxer, "checkpoint.pt")
             print("saving checkpoint")
             best=val_loss+giou        
         print(f"validation loss: {val_loss}, giou: {giou}")                
 optimizer.zero_grad(set_to_none=True)
 
 
-# ### Testing
-
-# Random testing
+# **Save the model manually**
 
 # In[ ]:
 
 
-model = bboxer
-batch = train_data[8:32]
-loss, giou = evaluate_batch_routine(model, loss_fn,feature_extractor, batch, graphical=True)
-print(f"loss: {loss}, iou: {giou}")
+torch.save(bboxer, "checkpoint.pt")
+
+
+# **Load the model**
+
+# In[ ]:
+
+
+bboxer = torch.load("checkpoint.pt")
+
+
+# ## Testing and evaluating
+# 
+# We encountered a problem during the training procedure.
+# In fact, although the training loss and GIoU decreases during train, the validation loss and GIoU stays the same, even sometime increases.
+# 
+# This seems to be exactly an overfitting problem. However, we tried different methods to prevent overfitting:
+# - Introduction of `Dropout` layers into our regressor
+# - Introduction of trainable `BatchNorm1d` layers
+# - Increased the effectively active training set up to around 10 000 elements
+# 
+# Nonetheless, the problem still persists.
+
+# In[ ]:
+
+
+def evaluate(bboxer, start, end, batch_size, data):
+    l = []
+    io = []
+    for i in tqdm(range(start, end, batch_size)):
+        batch_data = data[i:i+batch_size]
+        loss, giou = evaluate_batch_routine(bboxer, loss_fn, feature_extractor, batch_data, graphical=False)
+        l.append(loss)
+        io.append(giou)
+    print(f"loss: {sum(l)/len(l)}, iou: {sum(io)/len(io)}")
+
+
+# Run on the whole training set
+
+# In[ ]:
+
+
+evaluate(bboxer, 0, train_size, train_batch_size, train_data)
+
+
+# Evaluate on custom data
+
+# In[ ]:
+
+
+# train_data, validation_data, test_data
+evaluate(bboxer, 0, validation_size, validation_batch_size, validate_data)
+#evaluate(bboxer, 0, test_size, test_batch_size, test_data)
 
 
 # # Conclusions
