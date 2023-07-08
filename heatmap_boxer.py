@@ -7,7 +7,7 @@
 # 
 # This is required to import the required packages!
 
-# In[ ]:
+# In[1]:
 
 
 import numpy as np
@@ -29,6 +29,8 @@ from clip.model import CLIP
 from clip.model import convert_weights
 from torchvision.ops import generalized_box_iou_loss
 from torchvision.ops.boxes import box_convert
+import random
+import torchvision.transforms as transforms
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -50,7 +52,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # **The path of the dataset must be adjusted based on the location of the dataset folder!**
 
-# In[ ]:
+# In[2]:
 
 
 # adjust based on the location of the dataset folder!
@@ -59,14 +61,14 @@ refcocog_path =  "E:/DL_Datasets/refcocog"
 
 # Load the pickle file and the instances json file
 
-# In[ ]:
+# In[3]:
 
 
 pick = pickle.load(open(refcocog_path+"/annotations/refs(umd).p", "rb"))
 jsn = json.load(open(refcocog_path+"/annotations/instances.json", "rb"))
 
 
-# In[ ]:
+# In[4]:
 
 
 # set of all images
@@ -90,7 +92,7 @@ for a in jsn['annotations']:
 
 # **Build dataset splits**
 
-# In[ ]:
+# In[5]:
 
 
 train_data, train_label       = [], []
@@ -120,11 +122,8 @@ print(f"train {len(train_data)}, validation {len(validate_data)}, test {len(test
 
 # ### Dataset utils methods
 
-# In[ ]:
+# In[6]:
 
-
-import random
-import torchvision.transforms as transforms
 
 def draw_box_on_image(image,size, bbox, color):
     w, h = size
@@ -132,8 +131,19 @@ def draw_box_on_image(image,size, bbox, color):
     p2 = (int((bbox[0]+bbox[2])*w), int((bbox[1] + bbox[3])*h))
     cv2.rectangle(image, p1, p2, color, 3)
 
+def compute_target_heatmap(image, box):
+    img_w, img_h = image.size
+    x1 = int((box[0]) / img_w * 224)
+    y1 = int((box[1]) / img_h * 224)
+    x2 = int((box[0] + box[2]) / img_w * 224)
+    y2 = int((box[1] + box[3]) / img_h * 224)
+
+    target = torch.zeros((224, 224))
+    target[y1:y2+1, x1:x2+1] = 1
+    return target
+
 def get_batch_data(batch, image_augment=False, augment_p=0.25):
-    images, target_boxes, prompts = [], [], []
+    images, target_boxes, prompts, target_heatmaps = [], [], [], []
     for image_path, prompt, box in batch:
         image = Image.open(image_path).convert("RGB")
         w, h = image.size
@@ -146,9 +156,11 @@ def get_batch_data(batch, image_augment=False, augment_p=0.25):
         correct_box = [box[0] / w, box[1] / h, box[2] / w, box[3] / h]
         target_boxes.append(correct_box)
         images.append(image)            
-        prompts.append(prompt)            
-    target_boxes = torch.tensor(target_boxes)
-    return images, prompts, target_boxes
+        prompts.append(prompt)        
+        target_heatmaps.append(compute_target_heatmap(image, box))    
+    target_boxes = torch.tensor(target_boxes).to(device)
+    target_heatmaps = torch.stack(target_heatmaps).to(device)
+    return images, prompts, target_boxes, target_heatmaps
 
 def view_image_with_bbox(image_path, prompt, bbox):
     image = Image.open(image_path).convert("RGB")
@@ -181,17 +193,18 @@ def view_image_with_bbox(image_path, prompt, bbox):
 
 # ### Code
 
-# In[ ]:
+# In[7]:
 
 
+yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 execute_baseline = False
 
 
-# In[ ]:
+# In[8]:
 
 
 if execute_baseline:
-    yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+
     base_clip, base_clip_preprocess = clip.load("RN50")
     losses = []
 
@@ -307,7 +320,7 @@ if execute_baseline:
 # 
 # The final method `build_feature_extractor_model` has the job of creating this customized CLIP and to enable **transfer learning** from CLIP by copying the relative weights into the custom model.
 
-# In[ ]:
+# In[9]:
 
 
 # load the CLIP model
@@ -456,7 +469,46 @@ def build_feature_extractor_model(clip_model):
 # 
 # ![1.png](attachment:1.png) ![h_1.png](attachment:h_1.png)
 
-# In[ ]:
+# In[10]:
+
+
+class HeatmapRemapper(nn.Module):
+    def __init__(self,blur =True) -> None:
+        super().__init__()
+        self.apply_blur=blur
+        self.conv = nn.Sequential(                            
+                nn.Conv2d(1,1,9,stride=2), 
+                nn.BatchNorm2d(1),
+                nn.Dropout2d(p=0.2),
+                nn.Conv2d(1,1,7,stride=2), 
+                nn.BatchNorm2d(1),
+                nn.Dropout2d(p=0.2),
+                nn.Conv2d(1,1,5,stride=1)
+            )
+        self.ffn = nn.Sequential(                            
+                nn.Flatten(),
+                nn.AvgPool1d(4),
+                
+                nn.Linear(552, 1024),
+                nn.Sigmoid(),
+                nn.Dropout(p=0.2),
+
+                nn.Linear(1024, 4096),
+                nn.Sigmoid(),
+                nn.Dropout(p=0.2)
+            )
+            
+    def forward(self, heatmaps):
+        heatmaps = self.conv(heatmaps)
+        heatmaps = self.ffn(heatmaps)
+        heatmaps = heatmaps.reshape((heatmaps.shape[0], 1, 64, 64))
+        heatmaps = F.interpolate(heatmaps, size=(224, 224), mode="bilinear", antialias=True, align_corners=True).squeeze(dim=1)       
+        if self.apply_blur:        
+            return transforms.functional.gaussian_blur(heatmaps, 27, (0.25))
+        return heatmaps
+
+
+# In[12]:
 
 
 class ResNetHighResV2(nn.Module):
@@ -467,7 +519,7 @@ class ResNetHighResV2(nn.Module):
         self.clip_preprocess = clip_preprocess
         self.tokenize = tokenize
         self.temperature = temperature
-        self.remap_heatmaps=remap_heatmaps
+        self.remap_heatmaps=remap_heatmaps        
 
     def get_image_features(self, images):
         images = [clip_preprocess(image) for image in images]
@@ -484,17 +536,21 @@ class ResNetHighResV2(nn.Module):
         image_features /= image_features.norm(dim=1, keepdim=True)
         text_features /= text_features.norm(dim=1, keepdim=True)
         heatmaps = (image_features * text_features[:, :, None, None]).sum(1)
+        # print(f"img features: {image_features.shape}")
+        # print(f"txt features: {text_features.shape}")
+        # print(f"heatmaps: {heatmaps.shape}")
         heatmaps = torch.exp(heatmaps/self.temperature)
         if self.remap_heatmaps:
             for i in range(len(heatmaps)):
                 min = torch.min(heatmaps[i])
-                heatmaps[i] = -1 + 2 * (heatmaps[i] - min) / (torch.max(heatmaps[i])-min) + 1E-3
-                #heatmaps[i] = (heatmaps[i] - min) / (torch.max(heatmaps[i])-min) + 1E-3
+                #heatmaps[i] = -1 + 2 * (heatmaps[i] - min) / (torch.max(heatmaps[i])-min) + 1E-3
+                heatmaps[i] = (heatmaps[i] - min) / (torch.max(heatmaps[i])-min) + 1E-3        
         return heatmaps
 
     def forward(self, images, texts):
         image_features = self.get_image_features(images)
         text_features = self.get_text_features(texts)
+        
         heatmaps = self.get_heatmaps(image_features, text_features)
         heatmaps = heatmaps.cpu().detach().float()
         return heatmaps
@@ -517,7 +573,7 @@ class ResNetHighResV2(nn.Module):
 # 
 # The second sequential layer is composed of an `AvgPool1d` that has the job to smooth the heatmap, followed by a **FFNN** that effectively regresses the four points.
 
-# In[ ]:
+# In[13]:
 
 
 class ScaledSigmoid(nn.Module):
@@ -531,12 +587,15 @@ class HeatmapToBox(nn.Module):
     """Custom model to regress a bounding box from an heatmap"""
     def __init__(self):
         super().__init__()  
-        self.conv = nn.Sequential(                            
+        self.seq = nn.Sequential(                            
             nn.Conv2d(1,1,9,stride=1), 
+            nn.BatchNorm2d(1),
+            nn.Dropout2d(p=0.2),
             nn.Conv2d(1,1,7,stride=2), 
-            nn.Conv2d(1,1,3,stride=2)
-            )
-        self.seq = nn.Sequential(    
+            nn.BatchNorm2d(1),
+            nn.Dropout2d(p=0.2),
+            nn.Conv2d(1,1,3,stride=2),
+            
             nn.Flatten(),
             nn.AvgPool1d(4),
 
@@ -551,8 +610,8 @@ class HeatmapToBox(nn.Module):
             nn.Sigmoid(), 
 
             nn.Linear(128, 4),
-            nn.Sigmoid(),       
-        ) 
+            nn.Sigmoid(),    
+            )
         print(f"bboxer parameters: {self.params_count()}")
          
     def params_count(self):
@@ -562,7 +621,7 @@ class HeatmapToBox(nn.Module):
         return c
 
     def forward(self, x):   
-        return self.seq(self.conv(x.unsqueeze(dim=1)))
+        return self.seq(x.unsqueeze(dim=1))
 
 
 # # Training
@@ -584,7 +643,7 @@ class HeatmapToBox(nn.Module):
 # 
 # Boxes are converted from the **RefCOCOg** format to the format required by `torchvision`.
 
-# In[ ]:
+# In[14]:
 
 
 def iou(boxes1, boxes2) -> torch.Tensor:
@@ -607,12 +666,12 @@ def iou(boxes1, boxes2) -> torch.Tensor:
 
 # **Training parameters**
 
-# In[ ]:
+# In[15]:
 
 
-train_size = 512
-train_batch_size = 16
-epochs = 256
+train_size = 64
+train_batch_size = 8
+epochs = 64
 mini_train_data = train_data[:train_size]
 
 validation_size = 256
@@ -630,40 +689,45 @@ mini_test_data = test_data[:test_size]
 # - Validation
 # - Test
 
-# In[ ]:
+# In[16]:
 
 
 import os
 
-def evaluate_batch_routine(model, loss_fn, feature_extractor, data_batch, graphical=False, save=False):
+def evaluate_batch_routine(model, loss_fn, feature_extractor,remapper, data_batch, graphical=False, save=False):
+    get_ipython().run_line_magic('matplotlib', 'inline')
     if save:
         try: 
             os.mkdir("imgs") 
         except OSError as error: 
             pass 
     model.eval()
-    images, prompts, target_boxes = get_batch_data(data_batch)    
+    remapper.eval()
+    images, prompts, target_boxes, target_heatmaps = get_batch_data(data_batch)    
     with torch.no_grad():
         heatmaps = feature_extractor(images, prompts)
-        heatmaps_tensor = torch.tensor(np.array(heatmaps))
-        prediction_boxes = model(heatmaps_tensor)
-    c =0
+        predicted_heatmaps = remapper(heatmaps.unsqueeze(dim=1).to(device))
+        prediction_boxes = model(predicted_heatmaps)
+    c=0
     if graphical:
-        for img, p, heatmap, correct, predicted in zip(images, prompts, heatmaps, target_boxes, prediction_boxes):
+        for img, p, heatmap, correct, predicted, p_heatmap in zip(images, prompts, heatmaps, target_boxes, prediction_boxes,predicted_heatmaps):
             size = img.size
             img_arr = np.asarray(img)
             draw_box_on_image(img_arr, size, predicted, (255,0,0))                    
             draw_box_on_image(img_arr, size, correct, (0,255,0))
 
-            f = plt.figure()
+            f = plt.figure(figsize=(16,9))
             plt.title(p)       
             plt.axis("off") 
-            ax1=f.add_subplot(1,2, 1)
-            ax1.imshow(img_arr)
-            ax1.axis("off")
-            ax2=f.add_subplot(1,2, 2)
-            ax2.imshow(heatmap)
-            ax2.axis("off")
+            ax=f.add_subplot(1, 3, 1)
+            ax.imshow(img_arr)
+            ax.axis("off")
+            ax=f.add_subplot(1, 3, 2)
+            ax.imshow(heatmap.cpu())
+            ax.axis("off")
+            ax=f.add_subplot(1, 3, 3)
+            ax.imshow(p_heatmap.cpu())
+            ax.axis("off")
             if save:
                 plt.savefig(f"imgs/{c}.png")
             plt.show()
@@ -674,73 +738,79 @@ def evaluate_batch_routine(model, loss_fn, feature_extractor, data_batch, graphi
     loss = loss_fn(prediction_boxes, target_boxes)
     return loss.item(), iou(prediction_boxes, target_boxes)
 
-def training_routine(model, loss_fn, feature_extractor, optimizer):
+def training_routine(model, loss_fn, feature_extractor, remapper, optimizer):
     model.train()
     epoch_loss =[]
     for i in range(0, train_size, train_batch_size):
-        batch_data = mini_train_data[i:i+train_batch_size]
-        images, prompts, target_boxes = get_batch_data(batch_data)  
-        with torch.no_grad():
-            heatmaps = feature_extractor(images, prompts)            
-            heatmaps_tensor = torch.tensor(np.array(heatmaps))
-
         optimizer.zero_grad()
-        prediction_boxes = model(heatmaps_tensor)
-        loss = loss_fn(prediction_boxes, target_boxes)        
+
+        batch_data = mini_train_data[i:i+train_batch_size]
+        images, prompts, target_boxes, target_heatmaps = get_batch_data(batch_data)  
+        with torch.no_grad():
+            pred_heatmaps = remapper(feature_extractor(images, prompts).unsqueeze(dim=1).to(device))           
+        prediction_boxes = model(pred_heatmaps)
+
+        loss = loss_fn(prediction_boxes, target_boxes)      
+
         epoch_loss.append(loss.item())
         loss.backward()
         optimizer.step()
 
     return sum(epoch_loss) / len(epoch_loss)
 
-def validation_routine(model, loss_fn, feature_extractor):
-    model.eval()
-    epoch_loss = []
-    giou = []
-    print("running validation")
-    for i in range(0, validation_size, validation_batch_size):
-        batch_data = mini_val_data[i:i+validation_batch_size]
-        images, prompts, target_boxes = get_batch_data(batch_data)  
+def remapper_training_routine(loss_fn, feature_extractor, remapper, optimizer):
+    remapper.train()
+    epoch_loss =[]
+    for i in range(0, train_size, train_batch_size):
+        optimizer.zero_grad()
 
+        batch_data = mini_train_data[i:i+train_batch_size]
+        images, prompts, target_boxes, target_heatmaps = get_batch_data(batch_data)  
         with torch.no_grad():
-            heatmaps = feature_extractor(images, prompts)
-            heatmaps_tensor = torch.tensor(np.array(heatmaps))
-            prediction_boxes = model(heatmaps_tensor)
-            loss = loss_fn(prediction_boxes, target_boxes)
-            epoch_loss.append(loss.item())
-            giou.append(iou(prediction_boxes, target_boxes))
+            heatmaps = feature_extractor(images, prompts).unsqueeze(dim=1).to(device)
+        pred_heatmaps = remapper(heatmaps)           
+        rem_loss = loss_fn(pred_heatmaps, target_heatmaps)
+        epoch_loss.append(rem_loss.item())
 
-    return sum(epoch_loss) / len(epoch_loss), sum(giou) / len(giou)
+        rem_loss.backward()
+        optimizer.step()
 
-def test_routine(model, loss_fn, feature_extractor):
-    model.eval()
-    epoch_loss = []
-    giou = []
-    print("running test")
-    for i in range(0, test_size, test_batch_size):
-        batch_data = mini_test_data[i:i+test_batch_size]
-        images, prompts, target_boxes = get_batch_data(batch_data)  
-
-        with torch.no_grad():
-            heatmaps = feature_extractor(images, prompts)
-            heatmaps_tensor = torch.tensor(np.array(heatmaps))
-            prediction_boxes = model(heatmaps_tensor)
-            loss = loss_fn(prediction_boxes, target_boxes)
-            epoch_loss.append(loss.item())
-            giou.append(iou(prediction_boxes, target_boxes))
-        
-    return sum(epoch_loss) / len(epoch_loss), sum(giou) / len(giou)
+    return sum(epoch_loss) / len(epoch_loss)
 
 
 # ### Training Cycle
 
+# In[17]:
+
+
+feature_extractor = ResNetHighResV2(clip_preprocess, clip_model, clip.tokenize, remap_heatmaps=True, temperature=0.3).to(device)
+loss_fn = nn.MSELoss()
+
+
+# #### Training the heatmap remapper
+
 # In[ ]:
 
 
-feature_extractor = ResNetHighResV2(clip_preprocess, clip_model, clip.tokenize, remap_heatmaps=True, temperature=0.3)
+remapper = HeatmapRemapper().to(device)
+optimizer = torch.optim.Adam(params=remapper.parameters(), lr=1E-5)
+
+for epoch in range(epochs):
+    loss = remapper_training_routine(loss_fn ,feature_extractor,remapper, optimizer)
+    print(f"epoch {epoch}")
+    print(f"remapper loss: {loss}")             
+optimizer.zero_grad(set_to_none=True)
+torch.save(remapper, "remapper.pt")
+
+
+# #### Training the box regressor
+
+# In[ ]:
+
+
+bboxer = HeatmapToBox().to(device)
 loss_fn = nn.MSELoss()
-bboxer = HeatmapToBox()
-optimizer = torch.optim.Adam(params=bboxer.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(params=bboxer.parameters(), lr=1E-3)
 
 
 # In[ ]:
@@ -748,17 +818,15 @@ optimizer = torch.optim.Adam(params=bboxer.parameters(), lr=1e-3)
 
 best = 1E3
 for epoch in range(epochs):
-    loss = training_routine(bboxer,loss_fn ,feature_extractor, optimizer)
-    print(f"epoch {epoch}")
-    print(f"training_loss: {loss}")
-    if epoch != 0 and epoch % validation_module == 0:        
-        val_loss, giou = validation_routine(bboxer, loss_fn, feature_extractor)
-        if val_loss+giou < best:
-            torch.save(bboxer, "checkpoint.pt")
-            print("saving checkpoint")
-            best=val_loss+giou        
-        print(f"validation loss: {val_loss}, giou: {giou}")                
-optimizer.zero_grad(set_to_none=True)
+    loss = training_routine(bboxer,loss_fn ,feature_extractor,remapper, optimizer)
+    print(f"epoch {epoch} | loss {loss}")
+    # if epoch != 0 and epoch % validation_module == 0:        
+    #     val_loss, giou = evaluate_batch_routine(bboxer, loss_fn, feature_extractor, remapper, )
+    #     if val_loss+giou < best:
+    #         torch.save(bboxer, "checkpoint.pt")
+    #         print("saving checkpoint")
+    #         best=val_loss+giou        
+    #     print(f"validation loss: {val_loss}, giou: {giou}")                
 
 
 # **Save the model manually**
@@ -766,7 +834,7 @@ optimizer.zero_grad(set_to_none=True)
 # In[ ]:
 
 
-torch.save(bboxer, "checkpoint.pt")
+#torch.save(bboxer, "regressor.pt")
 
 
 # **Load the model**
@@ -774,7 +842,7 @@ torch.save(bboxer, "checkpoint.pt")
 # In[ ]:
 
 
-bboxer = torch.load("checkpoint.pt")
+#bboxer = torch.load("regressor.pt")
 
 
 # ## Testing and evaluating
@@ -792,12 +860,12 @@ bboxer = torch.load("checkpoint.pt")
 # In[ ]:
 
 
-def evaluate(bboxer, start, end, batch_size, data):
+def evaluate(start, end, batch_size, data, graphical=False):
     l = []
     io = []
     for i in tqdm(range(start, end, batch_size)):
         batch_data = data[i:i+batch_size]
-        loss, giou = evaluate_batch_routine(bboxer, loss_fn, feature_extractor, batch_data, graphical=False)
+        loss, giou = evaluate_batch_routine(bboxer, loss_fn, feature_extractor, remapper, batch_data, graphical=graphical)
         l.append(loss)
         io.append(giou)
     print(f"loss: {sum(l)/len(l)}, iou: {sum(io)/len(io)}")
@@ -808,17 +876,8 @@ def evaluate(bboxer, start, end, batch_size, data):
 # In[ ]:
 
 
-evaluate(bboxer, 0, train_size, train_batch_size, train_data)
-
-
-# Evaluate on custom data
-
-# In[ ]:
-
-
-# train_data, validation_data, test_data
-evaluate(bboxer, 0, validation_size, validation_batch_size, validate_data)
-#evaluate(bboxer, 0, test_size, test_batch_size, test_data)
+evaluate(0, validation_size, validation_batch_size, validate_data, graphical=False)
+evaluate(0, test_size, test_batch_size, test_data, graphical=False)
 
 
 # # Conclusions
