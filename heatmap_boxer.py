@@ -7,16 +7,18 @@
 # 
 # This is required to import the required packages!
 
-# In[1]:
+# In[ ]:
 
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 import torch
 import torch
 import torch.nn as nn
 import cv2
 import pickle
+import csv
 import json
 from PIL import Image
 import torch.nn.functional as F
@@ -26,12 +28,9 @@ from clip.model import ModifiedResNet
 from tqdm.auto import tqdm
 from typing import Tuple, Union
 from clip.model import CLIP
-from clip.model import convert_weights
 from torchvision.ops import generalized_box_iou_loss
 from torchvision.ops.boxes import box_convert
 import random
-from typing import Iterator
-from torch.nn.parameter import Parameter
 import torchvision.transforms as transforms
 
 
@@ -54,7 +53,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # **The path of the dataset must be adjusted based on the location of the dataset folder!**
 
-# In[2]:
+# In[ ]:
 
 
 # adjust based on the location of the dataset folder!
@@ -63,14 +62,14 @@ refcocog_path =  "E:/DL_Datasets/refcocog"
 
 # Load the pickle file and the instances json file
 
-# In[3]:
+# In[ ]:
 
 
 pick = pickle.load(open(refcocog_path+"/annotations/refs(umd).p", "rb"))
 jsn = json.load(open(refcocog_path+"/annotations/instances.json", "rb"))
 
 
-# In[4]:
+# In[ ]:
 
 
 # set of all images
@@ -94,7 +93,7 @@ for a in jsn['annotations']:
 
 # **Build dataset splits**
 
-# In[5]:
+# In[ ]:
 
 
 train_data, train_label       = [], []
@@ -124,7 +123,7 @@ print(f"train {len(train_data)}, validation {len(validate_data)}, test {len(test
 
 # ### Dataset utils methods
 
-# In[6]:
+# In[ ]:
 
 
 def draw_box_on_image(image,size, bbox, color):
@@ -197,14 +196,14 @@ def view_image_with_bbox(image_path, prompt, bbox):
 
 # ### Code
 
-# In[7]:
+# In[ ]:
 
 
 yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 execute_baseline = False
 
 
-# In[8]:
+# In[ ]:
 
 
 if execute_baseline:
@@ -324,7 +323,7 @@ if execute_baseline:
 # 
 # The final method `build_feature_extractor_model` has the job of creating this customized CLIP and to enable **transfer learning** from CLIP by copying the relative weights into the custom model.
 
-# In[9]:
+# In[ ]:
 
 
 clip_model, clip_preprocess = clip.load("RN50",jit=False,device=device)
@@ -390,12 +389,7 @@ class CLIPSpatialResNet(CLIP):
                                             output_dim=embed_dim,
                                             heads=vision_heads,
                                             input_resolution=image_resolution,
-                                            width=vision_width)
-        
-        for param in self.parameters():
-            param.requires_grad = False
-        for param in self.visual.attnpool.parameters():
-            param.requires_grad = True
+                                            width=vision_width)        
 
 
     def forward(self, image):
@@ -447,19 +441,23 @@ def build_feature_extractor_model(clip_model):
     model = CLIPSpatialResNet(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers).to(device)
-
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers)#.to(device)
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in clip_state_dict:
             del clip_state_dict[key]
 
-    #convert_weights(model)
 
     # False for the average filter layer.
     model.load_state_dict(clip_state_dict, strict=False)
-    # model.eval()
+    model.eval()
     if device == 'cpu':
         model.float()
+    for param in model.parameters():
+            param.requires_grad = False
+    # for param in model.visual.attnpool.parameters():
+    #     param.requires_grad = True
+    
+    #convert_weights(model)
     return model
 
 
@@ -481,7 +479,7 @@ def build_feature_extractor_model(clip_model):
 
 # #### Generator
 
-# In[10]:
+# In[ ]:
 
 
 class ResNetHighResV2(nn.Module):
@@ -506,21 +504,15 @@ class ResNetHighResV2(nn.Module):
         return text_features
     
     def get_heatmaps(self, image_features, text_features):
-        # image_features /= image_features.norm(dim=1, keepdim=True)
-        # (text_features / text_features.norm(dim=1, keepdim=True))
         heatmaps = ((image_features / image_features.norm(dim=1, keepdim=True)) * (text_features / text_features.norm(dim=1, keepdim=True))[:, :, None, None]).sum(1)
-        # print(f"img features: {image_features.shape}")
-        # print(f"txt features: {text_features.shape}")
-        # print(f"heatmaps: {heatmaps.shape}")
         heatmaps = torch.exp(heatmaps/self.temperature)
         if self.remap_heatmaps:
             norm_heatmaps = torch.tensor(heatmaps)
             for i in range(len(heatmaps)):
                 min = torch.min(heatmaps[i])
-                #heatmaps[i] = -1 + 2 * (heatmaps[i] - min) / (torch.max(heatmaps[i])-min) + 1E-3
                 norm_heatmaps[i] = (heatmaps[i] - min) / (torch.max(heatmaps[i])-min) + 1E-3    
-        # heatmaps = torch.tensor(heatmaps, requires_grad=True)    
-            return norm_heatmaps
+            heatmaps = norm_heatmaps            
+        heatmaps = heatmaps.pow(5)
         return heatmaps
 
     def forward(self, images, texts):
@@ -528,8 +520,6 @@ class ResNetHighResV2(nn.Module):
         text_features = self.get_text_features(texts)
         heatmaps = self.get_heatmaps(image_features, text_features)
         return heatmaps.squeeze(dim=1)
-        #heatmaps = heatmaps.cpu().detach().float()
-        #return heatmaps
 
 
 # ### Bounding Box regressor
@@ -549,7 +539,7 @@ class ResNetHighResV2(nn.Module):
 # 
 # The second sequential layer is composed of an `AvgPool1d` that has the job to smooth the heatmap, followed by a **FFNN** that effectively regresses the four points.
 
-# In[23]:
+# In[ ]:
 
 
 class HeatmapToBox(nn.Module):
@@ -566,17 +556,17 @@ class HeatmapToBox(nn.Module):
 
             nn.Linear(676, 256),
             nn.BatchNorm1d(256),
-            #nn.Dropout(p=0.1),             
+            nn.Dropout(p=0.2),             
             nn.Sigmoid(), 
 
             nn.Linear(256, 128),  
             nn.BatchNorm1d(128),
-            #nn.Dropout(p=0.1),          
+            nn.Dropout(p=0.2),          
             nn.Sigmoid(), 
 
             nn.Linear(128, 4),
-            nn.Sigmoid(),    
-            )
+            nn.Sigmoid()
+        )
         print(f"bboxer parameters: {self.params_count()}")
          
     def params_count(self):
@@ -595,6 +585,8 @@ class HeatmapToBox(nn.Module):
 # - Finetuning the custom **Spatial CLIP**     
 #     This step aims in enforcing the spatial CLIP to generate good heatmaps. The loss is a `MSELoss` with respect to binary target heatmaps. These targets are basically heatmaps with the value 1 only on pixels inside the bounding box and 0 otherwise.
 #     
+#     **The pipeline code is present below, however we noticed that finetuning even only the last layer of the `ModifiedResNet` model requires huge amount of computational time, even when other layers are frozen. Therefore extensive training is not been carried out.**
+#     
 # - Training the **Box Regressor**     
 #     In this step we train our custom model to regress the actual bounding box
 # 
@@ -605,7 +597,7 @@ class HeatmapToBox(nn.Module):
 # 
 # Boxes are converted from the **RefCOCOg** format to the format required by `torchvision`.
 
-# In[12]:
+# In[ ]:
 
 
 def iou(boxes1, boxes2) -> torch.Tensor:
@@ -614,17 +606,16 @@ def iou(boxes1, boxes2) -> torch.Tensor:
 
 # **Training parameters**
 
-# In[13]:
+# In[ ]:
 
 
-train_size = 1024
-train_batch_size = 16
-epochs = 128
+train_size = 8192
+train_batch_size = 32
+epochs = 64
 mini_train_data = train_data[:train_size]
 
-validation_size = 256
+validation_size = 512
 validation_batch_size = 16
-validation_module = 16
 mini_val_data = validate_data[:validation_size]
 
 test_size = 256
@@ -634,7 +625,7 @@ mini_test_data = test_data[:test_size]
 
 # #### Utility functions
 
-# In[14]:
+# In[ ]:
 
 
 import os
@@ -650,7 +641,7 @@ def evaluate_batch_routine(model, loss_fn, feature_extractor,data_batch, graphic
     images, prompts, target_boxes, target_heatmaps = get_batch_data(data_batch)    
     with torch.no_grad():
         heatmaps = feature_extractor(images, prompts)
-        prediction_boxes = model(heatmaps)
+        prediction_boxes = model(heatmaps.to(device))
     c=0
     if graphical:
         for img, p, heatmap, correct, predicted in zip(images, prompts, heatmaps, target_boxes, prediction_boxes):
@@ -676,27 +667,45 @@ def evaluate_batch_routine(model, loss_fn, feature_extractor,data_batch, graphic
         print(f"correct {correct}, predict: {predicted}")
 
     loss = loss_fn(prediction_boxes, target_boxes)
-    return loss.item(), iou(prediction_boxes, target_boxes)
+    return loss.item(), iou(prediction_boxes, target_boxes).item()
 
 def training_routine(model, loss_fn, feature_extractor, optimizer):
-    model.train()
+    model.train()   
     epoch_loss =[]
-    for i in range(0, train_size, train_batch_size):
+    giou = []
+    for i in tqdm(range(0, train_size, train_batch_size)):
         optimizer.zero_grad()
 
         batch_data = mini_train_data[i:i+train_batch_size]
         images, prompts, target_boxes, target_heatmaps = get_batch_data(batch_data)  
         with torch.no_grad():
             pred_heatmaps = feature_extractor(images, prompts)     
-        prediction_boxes = model(pred_heatmaps)
+        prediction_boxes = model(pred_heatmaps.to(device))
 
         loss = loss_fn(prediction_boxes, target_boxes)      
 
         epoch_loss.append(loss.item())
+        giou.append(iou(prediction_boxes, target_boxes).item())
         loss.backward()
         optimizer.step()
 
-    return sum(epoch_loss) / len(epoch_loss)
+    return sum(epoch_loss) / len(epoch_loss), sum(giou) / len(giou)
+
+def validation_routine(model, loss_fn, feature_extractor):
+    model.eval()   
+    epoch_loss =[]
+    giou = []
+    for i in tqdm(range(0, validation_size, validation_batch_size)):
+        batch_data = mini_val_data[i:i+validation_batch_size]
+        images, prompts, target_boxes, target_heatmaps = get_batch_data(batch_data)  
+        with torch.no_grad():
+            pred_heatmaps = feature_extractor(images, prompts)     
+            prediction_boxes = model(pred_heatmaps.to(device))
+            loss = loss_fn(prediction_boxes, target_boxes)      
+            epoch_loss.append(loss.item())
+            giou.append(iou(prediction_boxes, target_boxes).item())
+
+    return sum(epoch_loss) / len(epoch_loss), sum(giou) / len(giou)
 
 def finetune_clip_routine(loss_fn, feature_extractor, optimizer):
     epoch_loss =[]
@@ -718,22 +727,208 @@ def finetune_clip_routine(loss_fn, feature_extractor, optimizer):
 
 # #### Finetuning the Spatial CLIP
 
-# In[15]:
+# In[ ]:
 
 
-feature_extractor = ResNetHighResV2(clip_preprocess, clip_model, clip.tokenize, remap_heatmaps=False, temperature=0.3).to(device)
-loss_fn = nn.MSELoss()
+feature_extractor = ResNetHighResV2(clip_preprocess, clip_model, clip.tokenize, remap_heatmaps=True, temperature=0.35).to(device)
 
 
 # In[ ]:
 
 
-optimizer = torch.optim.Adam(params=feature_extractor.spatial_model.visual.attnpool.parameters(), lr=4E-6)
-feature_extractor.spatial_model.visual.attnpool.train()
+loss_fn = nn.MSELoss()
+finetune = False
+if finetune:
+    optimizer = torch.optim.Adam(params=feature_extractor.spatial_model.visual.attnpool.parameters(), lr=4E-6)
+    feature_extractor.eval()
+    feature_extractor.spatial_model.visual.attnpool.train()
+    for epoch in range(epochs):
+        loss = finetune_clip_routine(loss_fn ,feature_extractor, optimizer)
+        print(f"epoch {epoch}")
+        print(f"loss: {loss}")             
+    optimizer.zero_grad(set_to_none=True)
+    feature_extractor.eval()
+    torch.save(feature_extractor, "extractor.pt")
+
+
+# In[ ]:
+
+
+#feature_extractor = torch.load("extractor.pt")
+
+
+# #### Training the box regressor
+# 
+# > We finished available hours of the Azure server quite fast, due to testing and training of old pipelines.
+# 
+# The following training process has been carried out on our personal PC, therefore we were forced to use very small training set.
+# As can be seen the model overfits the data very fast, due to the fact that the training data is very small, around 1000 elements. 
+# 
+# The overfit point is dependent of mainly the dimension of the dataset.
+# We believe that in situations in which the dataset is successfully large, the model could be able to effectively represent data, as intentionally overfitting small dataset allowed us to achieve under `0.5` GIoU.
+# 
+# In the testing environment, the model reached around `0.8` GIoU by only training on a dataset of 1000 elements.
+# 
+# In order to improve the current pipeline, suggestions are presented at the end of the notebook, in the Future Work section.
+# 
+# ![image-2.png](attachment:image-2.png)
+
+# In[ ]:
+
+
+bboxer = HeatmapToBox().to(device)
+loss_fn = nn.MSELoss()
+optimizer = torch.optim.Adam(params=bboxer.parameters(), lr=4E-4)
+
+
+# In[ ]:
+
+
+best = 1E3
+best_giou = 1E4
+val_loss = val_giou = 1E3
+with open("training.csv", "w", newline="") as file:
+    csvwriter = csv.writer(file)
+    csvwriter.writerow(["epoch", "loss", "giou","val_loss","val_giou"])
+
 for epoch in range(epochs):
-    loss = finetune_clip_routine(loss_fn ,feature_extractor, optimizer)
-    print(f"epoch {epoch}")
-    print(f"loss: {loss}")             
-optimizer.zero_grad(set_to_none=True)
-feature_extractor.eval()
-torch.save(feature_extractor, "extractor.pt")
+    # if epoch % 2 == 0:
+    #     val_loss, val_giou = validation_routine(bboxer, loss_fn, feature_extractor)
+    loss, giou = training_routine(bboxer, loss_fn, feature_extractor, optimizer)
+    with open("training.csv", "a", newline="") as file:
+        csvwriter = csv.writer(file)
+        csvwriter.writerow([epoch, loss, giou, val_loss, val_giou])
+
+    print(f"epoch {epoch} | loss {loss} | giou {giou} | val_loss {val_loss} | val_giou {val_giou}")
+    
+    # if best_giou > val_giou:
+    #     torch.save(bboxer, "checkpoint.pt")
+    #     best_giou=val_giou     
+torch.save(bboxer, "regressor.pt")
+
+
+# In[ ]:
+
+
+# %matplotlib inline
+# df = pd.read_csv("training.csv")
+
+# f = plt.figure(figsize=(12,6))
+
+# ax=f.add_subplot(1, 2, 1)
+# ax.set_title("MSELoss")
+# ax.plot(df.epoch, df.loss)
+# ax.plot(df.epoch, df.val_loss.rolling(10).mean())
+# ax.legend(["training","validation"], loc=3)
+
+# ax=f.add_subplot(1, 2, 2)
+# ax.set_title("GIoU")
+# ax.plot(df.epoch, df.giou)
+# ax.plot(df.epoch, df.val_giou.rolling(10).mean())
+# ax.legend(["training","validation"], loc=3)
+
+# plt.savefig("losses.png")
+# plt.show()
+
+
+# **Save the model manually**
+
+# In[ ]:
+
+
+#torch.save(bboxer, "regressor.pt")
+
+
+# **Load the model**
+
+# In[ ]:
+
+
+#bboxer = torch.load("regressor.pt")
+
+
+# ## Testing and evaluating
+# 
+# We noticed that the `HeatmapToBox` model is **highly dependant** on the quality of the heatmaps generated. If the heatmap is good, the training process is extremely faster and more effective.
+# 
+# This means that extensively training the Spatial CLIP model on the dataset would result is extremely better performance.
+# 
+# We didn't have the possibility to train the Spatial CLIP model on the dataset due to having finished the available hours of the Azure's server. This means that the regressor is extremely subjective to overfitting since we trained on very smallt raining data on our personal computers.
+# 
+# Nonetheless, the below results have been achieved on the training data without training the Spatial CLIP at all.
+# 
+# Although the examples are drawn from the data the model is trained on, it can be seen that the model is able to **effectively represent** the data, suggesting that further regressor training togheter with the training of the Spatial CLIP could result in very good performance.
+# 
+# -----
+# 
+# > The presented results have been achieved on the training set
+# 
+# As the results show, the model is able to represent the data, we tested by intetionally overfitting small datasets.
+# 
+# - MSELoss: `5.7E-3`
+# - GIoU : `0.51`
+# 
+# -----
+# 
+# ![14.png](attachment:14.png)
+# ![12.png](attachment:12.png)
+# ![8.png](attachment:8.png)
+# ![15.png](attachment:15.png)
+
+# In[ ]:
+
+
+def evaluate(start, end, batch_size, data, graphical=False):
+    l = []
+    io = []
+    for i in tqdm(range(start, end, batch_size)):
+        batch_data = data[i:i+batch_size]
+        loss, giou = evaluate_batch_routine(bboxer, loss_fn, feature_extractor, batch_data, graphical=graphical)
+        l.append(loss)
+        io.append(giou)
+    print(f"loss: {sum(l)/len(l)}, iou: {sum(io)/len(io)}")
+
+
+# Run on the whole training set
+
+# In[ ]:
+
+
+whole = train_data + validate_data + test_data
+evaluate(0, len(whole), 32, whole, graphical=False)
+#evaluate(0, validation_size, validation_batch_size, validate_data, graphical=False)
+#evaluate(0, test_size, test_batch_size, test_data, graphical=False)
+
+
+# # Conclusions and Future Work
+# 
+# The proposed model is interesting due to the following reasons:
+# - It is a **single stage model** to perform phrase grounding
+# - It enables the CLIP model to be used for phrase grounding
+# - The modularity of the framework enabled the head to be swapped extremely easily. This means that any head capable of regressing a bounding box from an heatmap in the proposed form can be attached
+# - It involves the possibility to finetune CLIP itself for the phrase grounding task
+# 
+# The quite poor validation performance achieved is due to many reasons. 
+# 
+# - The training data has not been exploited at its fullest: due to time and computational power constraints, an extensive process of training could not be achieved
+# - The regressor is a brand new model that does not exploit transfer learning, meaning that it has to be trained from scratch
+# 
+# Nonetheless, the model was able to perfectly overfit small samples of the training data, demonstrating that its strucutre is able to actually represent the data samples in an efficient way.
+# 
+# #### Improvements
+# 
+# The model could be improved in the following ways:
+# - Extensive training on larger dataset, with better hardware resources
+# - Tweaks to the shape and the hyperparameters of the `HeatmapToBox` head model
+# - Finetuning the Spatial CLIP model itself in order to better adapt it to the target dataset
+# 
+# Data augmentation has been tested. However, we believe that it may not be the most crucial point in fixing the overfitting problem as the RefCOCOg dataset includes different prompts for the same image and bounding box. This can be effectively already be seen as a text augmentation. From the point of view of the model, the same image with different prompts, must produce the same bounding box.
+# 
+# 
+# The results showed that potentially this structure may serve as a good fundation for phrase grounding framework that are able to adapt pretrained larger models such as CLIP for a specific task such as phrase grounding.
+
+# # Bibliography
+# - [1] [Adapting CLIP For Phrase Localization Without Further Training](https://arxiv.org/abs/2204.03647)
+# - [2] [A Fast and Accurate One-Stage Approach to Visual Grounding](https://arxiv.org/abs/1908.06354)
+# - [3] [Improving neural networks by preventing co-adaptation of feature detectors](https://arxiv.org/abs/1207.0580)
+# - [4] [Learning Transferable Visual Models From Natural Language Supervision](https://arxiv.org/abs/2103.00020)
