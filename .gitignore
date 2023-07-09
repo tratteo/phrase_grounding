@@ -19,6 +19,7 @@ lib/
 imgs/
 lib64/
 parts/
+*.csv
 sdist/
 var/
 wheels/
