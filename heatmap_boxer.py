@@ -18,10 +18,13 @@ import torch
 import torch.nn as nn
 import cv2
 import pickle
+import os
 import csv
 import json
 from PIL import Image
 import torch.nn.functional as F
+import torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 import clip
 from clip.model import AttentionPool2d
 from clip.model import ModifiedResNet
@@ -85,10 +88,13 @@ for a in jsn['annotations']:
   annotations_set[annotation_id] = a
 
 # set of all categories
-# categories_set = {}
-# for c in jsn['categories']:
-#   category_id = c['id']
-#   categories_set[category_id] = c
+categories_set = {}
+max_cat=0
+for c in jsn['categories']:
+  category_id = c['id']
+  categories_set[category_id] = c
+  if c['id'] > max_cat:
+    max_cat = c['id']
 
 
 # **Build dataset splits**
@@ -99,17 +105,16 @@ for a in jsn['annotations']:
 train_data, train_label       = [], []
 validate_data, validate_label = [], []
 test_data, test_label         = [], []
-
 for p in pick:
     data_image_path = f"{refcocog_path}/images/{images_set[p['image_id']]['file_name']}"
     data_sentences = p['sentences']
     data_bbox = annotations_set[p['ann_id']]['bbox']
-
+    
     data = []
 
     for s in data_sentences:
         sentence = s['sent']
-        data.append([data_image_path, sentence, data_bbox])
+        data.append([data_image_path, sentence, data_bbox, p["category_id"]])
 
     if p['split'] == 'train':
         train_data.extend(data)
@@ -144,8 +149,8 @@ def compute_target_heatmap(image, box):
     return target
 
 def get_batch_data(batch, image_augment=False, augment_p=0.25):
-    images, target_boxes, prompts, target_heatmaps = [], [], [], []
-    for image_path, prompt, box in batch:
+    images, target_boxes, prompts, target_heatmaps, categories = [], [], [], [], []
+    for image_path, prompt, box, cat in batch:
         image = Image.open(image_path).convert("RGB")
         w, h = image.size
         if image_augment and random.random()<augment_p:
@@ -156,6 +161,7 @@ def get_batch_data(batch, image_augment=False, augment_p=0.25):
             
         correct_box = [box[0] / w, box[1] / h, box[2] / w, box[3] / h]
         target_boxes.append(correct_box)
+        categories.append(cat)
         images.append(image)            
         prompts.append(prompt)        
         target_heatmaps.append(compute_target_heatmap(image, box))    
@@ -163,7 +169,7 @@ def get_batch_data(batch, image_augment=False, augment_p=0.25):
     target_boxes.requires_grad=False
     target_heatmaps = torch.stack(target_heatmaps).to(device)
     target_heatmaps.requires_grad=False
-    return images, prompts, target_boxes, target_heatmaps
+    return images, prompts, target_boxes, target_heatmaps, categories
 
 def view_image_with_bbox(image_path, prompt, bbox):
     image = Image.open(image_path).convert("RGB")
@@ -182,66 +188,226 @@ def view_image_with_bbox(image_path, prompt, bbox):
     plt.show()
 
 
-# # Baseline
+# # Using transfer learning: FastRCNN
 # 
-# In the following section there is the implementation of the baseline method suggested, using YOLO as bounding box extractor.
+# The pipeline is to feed the image to Fast-RCNN that returns a set of bounding boxes.
 # 
-# The pipeline is to feed the image to YOLO that returns a set of bounding boxes.
+# Each subimage corresponding to each bounding box is extracted and then the similarity between the CLIP's encoding of the subimage and the prompt is computed. When Fast-RCNN does not return a bounding box, we use the entire image as the bounding box.
 # 
-# Each subimage corresponding to each bounding box is extracted and then the similarity between the CLIP's encoding of the subimage and the prompt is computed.
 # The bounding box with the highest similarity is returned as output.
 # 
-# - **GIoU**: `0.574`
+# - **GIoU**: `0.6`
+
+# ### Dataset class
 # 
-
-# ### Code
-
-# In[ ]:
-
-
-yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-execute_baseline = False
-
+# This dataset class is created to adapt the RefCOCOg data to Fast-RCNN
 
 # In[ ]:
 
 
-if execute_baseline:
+finetuning_data = {}
 
+class RefCOCODataset(torch.utils.data.Dataset):
+    def __init__(self, data_dir, transforms=None):
+        self.data_dir = data_dir
+        self.transforms = transforms
+        # load the annotations file, it also contain information of image names
+        # load annotations
+        self.pick = pickle.load(open(self.data_dir+ "/annotations/refs(umd).p", "rb"))
+        self.jsn = json.load(open(self.data_dir+ "/annotations/instances.json", "rb"))
+
+        set = {}
+        for a in jsn['annotations']:
+            if set.get(a["image_id"]) is None:
+                set[a["image_id"]] = {}
+            bbox = a["bbox"]
+            label = categories_set[a["category_id"]]["id"]
+            
+            if set.get(a["image_id"]).get("bboxes") is None:
+                set[a["image_id"]]["bboxes"] = []
+            if set.get(a["image_id"]).get("labels") is None:
+                set[a["image_id"]]["labels"] = []
+            b = box_convert(torch.tensor(bbox), in_fmt="xywh",out_fmt="xyxy")
+            set[a["image_id"]]["bboxes"].append(b.tolist())    
+            set[a["image_id"]]["labels"].append( label)   
+
+        for i in jsn['images']:
+            image_id = i['id']
+            set[image_id]["file_name"] = i["file_name"]     
+            set[image_id]["image_id"] = image_id
+        self.elems = list(set.values())
+        self.tensor = torchvision.transforms.ToTensor()
+
+    def __getitem__(self, idx):
+
+        cur = self.elems[idx]
+        # get the image path from the annoations data
+        img = Image.open(self.data_dir +"/images/"+cur["file_name"]).convert("RGB")
+        img_res = self.tensor(img).to(device)
+        
+        boxes = cur["bboxes"]
+        num_objs = len(boxes)
+        labels = cur["labels"]
+
+        boxes = torch.as_tensor(boxes, dtype=torch.float32).to(device)
+        labels = torch.as_tensor(labels).to(device)
+
+        image_id = torch.tensor([cur["image_id"]]).to(device)
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]).to(device)
+        # suppose all instances are not crowd
+        iscrowd = torch.zeros((num_objs), dtype=torch.int64).to(device)
+
+        target = {}
+        target["boxes"] = boxes
+        target["labels"] = labels
+        target["image_id"] = image_id
+        target["area"] = area
+        target["iscrowd"] = iscrowd
+
+        if self.transforms is not None:
+            img_res, target = self.transforms(img_res, target)
+
+        return  img_res, target
+
+    def __len__(self):
+        return len(self.elems)
+
+
+# In[ ]:
+
+
+def get_batch(dataset, start, size):
+    images = []
+    targets = []
+    for i in range(start, start+size):
+        images.append(dataset[i][0])
+        targets.append(dataset[i][1])
+    return images, targets
+
+# load the dataset
+dataset = RefCOCODataset(refcocog_path)
+
+
+# ### Finetuning
+
+# In[ ]:
+
+
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+
+# cange head to finetune
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_features, max_cat) 
+
+model.to(device)
+
+
+# In[ ]:
+
+
+new_params = []
+pre_params = []
+for p in model.named_parameters():
+    if not p[1].requires_grad: continue
+    if "roi_heads.box_predictor" in p[0]:
+        new_params.append(p[1])
+    else:
+        pre_params.append(p[1])
+
+optimizer = torch.optim.SGD([
+    {"params":pre_params, "lr":5E-3},
+    {"params":new_params, "lr":1E-2}
+        ], momentum=0.9, weight_decay=0.0002)
+lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size=4, gamma=0.25)
+
+epochs = 64
+batch_size = 8
+# train for 75% of the dataset elements
+size = int(len(dataset)*0.75)
+
+model.train()
+for e in range(epochs):
+    losses = []
+    for i in range(0, 8, batch_size):
+        images, targets = get_batch(dataset, i, batch_size)
+        pred = model(images, targets)
+        l = sum(loss for loss in pred.values())
+        losses.append(l.item())
+        optimizer.zero_grad()
+        l.backward()
+        optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+    print(f"epoch {e} | loss {sum(losses)/len(losses)}")
+    
+torch.save(model, "fastrcnn.pt")
+
+
+# In[ ]:
+
+
+def predict(img_path, threshold=0.8):
+  img = Image.open(img_path)
+  transform = torchvision.transforms.Compose([torchvision.transforms.ToTensor()])
+  img = transform(img).to(device)
+  pred = model([img])
+
+  pred_class = [categories_set[i] for i in list(pred[0]['labels'].detach().cpu().numpy())]
+  pred_boxes = [[(i[0], i[1]), (i[2], i[3])] for i in list(pred[0]['boxes'].detach().cpu().numpy())]
+  pred_score = list(pred[0]['scores'].detach().cpu().numpy())
+  pred_t = [pred_score.index(x) for x in pred_score if x>threshold][-1]
+  pred_boxes = pred_boxes[:pred_t+1]
+  pred_class = pred_class[:pred_t+1]
+  return pred_boxes, pred_class
+
+def predict_and_show(img_path, threshold=0.5, rect_th=3, text_size=1, text_th=3): 
+  boxes, pred_cls = predict(img_path, threshold) 
+  img = cv2.imread(img_path) 
+  img = np.array(img)
+  img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) 
+  for i in range(len(boxes)): 
+    cv2.rectangle(img, (int(boxes[i][0][0]),int(boxes[i][0][1])), (int(boxes[i][1][0]),int(boxes[i][1][1])), (0, 255, 0), rect_th) 
+    cv2.putText(img,pred_cls[i], (int(boxes[i][0][0]),int(boxes[i][0][1])), cv2.FONT_HERSHEY_SIMPLEX, text_size, (0,255,0),thickness=text_th) 
+    plt.figure(figsize=(10,8)) 
+  plt.imshow(img)
+  plt.xticks([])
+  plt.yticks([])
+  plt.show()
+
+
+# In[ ]:
+
+
+#object_detection_api(train_data[0][0], threshold=0.8)
+execute = True
+
+if execute:
     base_clip, base_clip_preprocess = clip.load("RN50")
+    base_clip = base_clip.to(device)
     losses = []
 
-    for idx, data in enumerate(tqdm(test_data)):
+    for idx, data in enumerate(tqdm(train_data + validate_data + test_data)):
         image_path, prompt, target_box = data
         image =  Image.open(image_path).convert("RGB")
 
         image_copy = np.asarray(image)
         cropped_images = []
 
-        yolo_boxes = yolo_model(image_path).xyxy[0]
+        boxes, pred_cls = predict(image_path)
 
-        # when yolo returns no prediction, just use the whole thing as bbox
-        if len(yolo_boxes) == 0:
-            target_tensor = torch.tensor(target_box).cuda()
-            target_tensor = box_convert(target_tensor, in_fmt="xywh", out_fmt="xyxy")
-
+        if len(boxes) == 0:
+            target_tensor = torch.tensor(target_box).to(device)
             h, w = image.size
-            ans = torch.tensor([0, 0, h, w])
-
+            ans = torch.tensor([0, 0, h, w]).to(device)
             loss = generalized_box_iou_loss(ans, target_tensor)
             losses.append(loss.item())
-
             continue
 
-        for yolo_box in yolo_boxes:
-            x1, y1, x2, y2 = yolo_box[:4]
+        for ans_box in boxes:
+            (x1, y1), (x2, y2) = ans_box[:4]
             x1 = int(x1); y1 = int(y1); x2 = int(x2); y2 = int(y2)
-
             cropped_image = image_copy[y1:y2, x1:x2]
             cropped_images.append(cropped_image)
-
-            # plt.imshow(np.asarray(cropped_image))
-            # plt.show()
 
         preprocessed_images = []
         for img_np in cropped_images:
@@ -249,9 +415,9 @@ if execute_baseline:
             preprocessed_image = base_clip_preprocess(img)
             preprocessed_images.append(preprocessed_image)
 
-        cropped_image_tensors = torch.stack(preprocessed_images).cuda()
+        cropped_image_tensors = torch.stack(preprocessed_images).to(device)
 
-        text_tokens = clip.tokenize(prompt).cuda()
+        text_tokens = clip.tokenize(prompt).to(device)
         text_tokens.shape
 
         with torch.no_grad():
@@ -263,18 +429,16 @@ if execute_baseline:
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
         similarity = torch.matmul(image_features, text_features.T)
-        similarity
+        #similarity
 
         ans = similarity.argmax()
-        ans = yolo_boxes[ans][:4]
+        (x1, y1), (x2, y2) = boxes[ans][:4]
 
-        target_tensor = torch.tensor(target_box).cuda()
+        target_tensor = torch.tensor(target_box).to(device)
         target_tensor = box_convert(target_tensor, in_fmt="xywh", out_fmt="xyxy")
 
-        loss = generalized_box_iou_loss(ans, target_tensor)
+        loss = generalized_box_iou_loss(torch.tensor([x1,y1,x2,y2]).to(device), target_tensor)
         losses.append(loss.item())
-
-    # print(losses)
 
     print(f"GIoU: {sum(losses) / len(losses)}")
 
@@ -285,7 +449,7 @@ if execute_baseline:
 # 
 # The architecture proposed, is inspired by the recent work: [Adapting CLIP For Phrase Localization Without Further Training](https://arxiv.org/abs/2204.03647) by _Jiahao Li, Greg Shakhnarovich, Raymond A. Yeh_.
 # 
-# In their paper, the goal was to adapt the **CLIP** model to phrase localization, without the need of any further training. This goal is a perfect starting point in order to adapt their solution to out phrase grounding task for the project.
+# In their paper, the goal was to adapt the **CLIP** model to phrase localization without the need of any further training. This goal is a perfect starting point in order to adapt their solution to out phrase grounding task for the project.
 # 
 # To begin with, we have taken the "backbone" model from their repository: https://github.com/pals-ttic/adapting-CLIP.
 # The code borrowed includes the modification of the ResNet of CLIP in order to introduce, in the last layer, a spatial attention layer.
@@ -327,6 +491,7 @@ if execute_baseline:
 
 
 clip_model, clip_preprocess = clip.load("RN50",jit=False,device=device)
+clip_model = clip_model.to(device)
 
 def linear(x, weight, bias):
     x = x.matmul(weight.t())
@@ -609,8 +774,8 @@ def iou(boxes1, boxes2) -> torch.Tensor:
 # In[ ]:
 
 
-train_size = 8192
-train_batch_size = 32
+train_size = 128
+train_batch_size = 8
 epochs = 64
 mini_train_data = train_data[:train_size]
 
@@ -642,6 +807,7 @@ def evaluate_batch_routine(model, loss_fn, feature_extractor,data_batch, graphic
     with torch.no_grad():
         heatmaps = feature_extractor(images, prompts)
         prediction_boxes = model(heatmaps.to(device))
+
     c=0
     if graphical:
         for img, p, heatmap, correct, predicted in zip(images, prompts, heatmaps, target_boxes, prediction_boxes):
@@ -662,7 +828,7 @@ def evaluate_batch_routine(model, loss_fn, feature_extractor,data_batch, graphic
             if save:
                 plt.savefig(f"imgs/{c}.png")
             plt.show()
-            c +=1 
+            c += 1 
             
         print(f"correct {correct}, predict: {predicted}")
 
@@ -889,15 +1055,21 @@ def evaluate(start, end, batch_size, data, graphical=False):
     print(f"loss: {sum(l)/len(l)}, iou: {sum(io)/len(io)}")
 
 
-# Run on the whole training set
+# Run on the test set:
+
+# In[ ]:
+
+
+evaluate(0, len(test_data), 16, test_data)
+
+
+# Run on the whole dataset
 
 # In[ ]:
 
 
 whole = train_data + validate_data + test_data
-evaluate(0, len(whole), 32, whole, graphical=False)
-#evaluate(0, validation_size, validation_batch_size, validate_data, graphical=False)
-#evaluate(0, test_size, test_batch_size, test_data, graphical=False)
+evaluate(0, len(whole), 32, whole)
 
 
 # # Conclusions and Future Work
@@ -914,6 +1086,14 @@ evaluate(0, len(whole), 32, whole, graphical=False)
 # - The regressor is a brand new model that does not exploit transfer learning, meaning that it has to be trained from scratch
 # 
 # Nonetheless, the model was able to perfectly overfit small samples of the training data, demonstrating that its strucutre is able to actually represent the data samples in an efficient way.
+# 
+# #### Problems
+# 
+# We found that the model required a lot of time to be trained, we finished very fast our time available on the Azure server.
+# 
+# Also the problem of overfitting was quite high in our model. The reasons may be reconducted to the fact that our head does not include transfer learning and must be trained from scratch. Also the size of the dataset we were able to train the model on played an important role.
+# 
+# We tried implementing some techniques such as `Dropout` layers and `BarchNorm` layers. The situation remained almost the same.
 # 
 # #### Improvements
 # 
